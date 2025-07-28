@@ -1,3 +1,4 @@
+*.index
 *experiment*
 .idea/
 __pycache__/
