@@ -1,7 +1,8 @@
 import re
 import time
+import sys
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from pdb import set_trace as st 
 
 import faiss
 import json
@@ -14,14 +15,18 @@ import argparse
 import datasets
 import torch
 import argparse
-from seismic import SeismicIndex
+from seismic.seismic import SeismicIndex
 from tqdm import tqdm
 from flashrag.retriever.utils import load_model, load_corpus, pooling, set_default_instruction, judge_zh
 from transformers import AutoTokenizer, AutoModelForMaskedLM
+from transformers.hf_argparser import HfArgumentParser
 
 import os
 import multiprocessing
 import pickle
+
+from tevatron.retriever.arguments import DataArguments, ModelArguments
+from tevatron.retriever.arguments import TevatronTrainingArguments as TrainingArguments
 
 cores = str(multiprocessing.cpu_count())
 os.environ["RAYON_NUM_THREADS"] = cores
@@ -56,6 +61,9 @@ class Index_Builder:
             bm25_backend="bm25s",
             index_modal="all",
             nknn=0,
+            model_args: ModelArguments=None,
+            training_args: TrainingArguments=None,
+            data_args: DataArguments=None,
     ):
         self.retrieval_method = retrieval_method.lower()
         self.model_path = model_path
@@ -80,6 +88,15 @@ class Index_Builder:
         self.summary_energy = summary_energy
         self.batched_indexing = batched_indexing
         self.nknn = nknn
+        self.model_args = model_args
+        self.training_args = training_args
+        self.data_args = data_args
+        
+        self.torch_dtype = torch.float32 # Default
+        if training_args.bf16:
+            self.torch_dtype = torch.bfloat16
+        elif training_args.fp16:
+            self.torch_dtype = torch.float16
 
         # judge if the retrieval model is clip
         self.is_clip = ("clip" in self.retrieval_method) or (self.model_path is not None and "clip" in self.model_path)
@@ -502,14 +519,7 @@ class Index_Builder:
             self.batch_size = self.batch_size * self.gpu_num
             all_embeddings = self.encoder.multi_gpu_encode(encode_data, batch_size=self.batch_size, is_query=False)
         else:
-            with (
-                torch.autocast(
-                    "cuda", dtype=torch.float16 if self.fp16 else torch.bfloat16
-                )
-                if self.fp16 or self.bf16
-                else nullcontext()
-            ):
-                all_embeddings = self.encoder.encode(encode_data, batch_size=self.batch_size, is_query=False)
+            all_embeddings = self.encoder.encode(encode_data, batch_size=self.batch_size, is_query=False, dtype=self.torch_dtype)
 
         return all_embeddings
 
@@ -558,17 +568,55 @@ class Index_Builder:
             )
             hidden_size = self.encoder.model.get_sentence_embedding_dimension()
         else:
-            from flashrag.retriever.encoder import Encoder
+            # from flashrag.retriever.encoder import Encoder
+            # self.encoder = Encoder(
+            #     model_name=self.retrieval_method,
+            #     model_path=self.model_path,
+            #     pooling_method=self.pooling_method,
+            #     max_length=self.max_length,
+            #     use_fp16=self.fp16,
+            #     instruction=self.instruction,
+            # )
+            from retriever import Encoder
+            
+            if self.training_args.bf16:
+                self.torch_dtype = torch.bfloat16
+            elif self.training_args.fp16:
+                self.torch_dtype = torch.float16
+            else:
+                self.torch_dtype = torch.float32
 
-            self.encoder = Encoder(
-                model_name=self.retrieval_method,
-                model_path=self.model_path,
-                pooling_method=self.pooling_method,
-                max_length=self.max_length,
-                use_fp16=self.fp16,
-                instruction=self.instruction,
+            tokenizer = AutoTokenizer.from_pretrained(
+                (
+                    self.model_args.tokenizer_name
+                    if self.model_args.tokenizer_name
+                    else self.model_args.model_name_or_path
+                ),
+                cache_dir=self.model_args.cache_dir,
             )
-            hidden_size = self.encoder.model.config.hidden_size
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+
+            if self.data_args.padding_side == "right":
+                tokenizer.padding_side = "right"
+            else:
+                tokenizer.padding_side = "left"
+            self.encoder = Encoder.load(
+                self.model_args.model_name_or_path,
+                pooling=self.model_args.pooling,
+                normalize=self.model_args.normalize,
+                lora_name_or_path=self.model_args.lora_name_or_path,
+                cache_dir=self.model_args.cache_dir,
+                torch_dtype=self.torch_dtype,
+                attn_implementation=self.model_args.attn_implementation,
+                tokenizer=tokenizer,
+                data_args=self.data_args,
+                instruction=self.data_args.query_instruction,
+            )
+            self.encoder = self.encoder.to(self.training_args.device)
+            self.encoder.eval()
+            
+            hidden_size = self.encoder.encoder.config.hidden_size
 
         if self.embedding_path is not None:
             corpus_size = len(self.corpus)
@@ -636,21 +684,17 @@ class Index_Builder:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Creating index.")
+    # parser = argparse.ArgumentParser(description="Creating index.")
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
 
     # Basic parameters
     parser.add_argument("--retrieval_method", default="dense", type=str)
     parser.add_argument("--model_path", type=str, default=None)
-    parser.add_argument("--corpus_path", type=str)
     parser.add_argument("--corpus_embedded_path", type=str, default=None)
     parser.add_argument("--save_dir", default="indexes/", type=str)
 
     # Parameters for building dense index
-    parser.add_argument("--max_length", type=int, default=180)
     parser.add_argument("--batch_size", type=int, default=512)
-    # parser.add_argument("--use_fp16", default=False, action="store_true")
-    parser.add_argument("--fp16", default=False, action="store_true")
-    parser.add_argument("--bf16", default=False, action="store_true")
     parser.add_argument("--pooling_method", type=str, default=None)
     parser.add_argument("--instruction", type=str, default=None)
     parser.add_argument("--faiss_type", default=None, type=str)
@@ -671,17 +715,36 @@ def main():
     parser.add_argument("--nknn", type=int, default=0)
     parser.add_argument("--batched_indexing", type=int, default=10000)
 
-    args = parser.parse_args()
+    # args = parser.parse_args()
+    
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        model_args, data_args, training_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1])
+        )
+    else:
+        model_args, data_args, training_args, args = parser.parse_args_into_dataclasses()
+        model_args: ModelArguments
+        data_args: DataArguments
+        training_args: TrainingArguments
+
+    if training_args.local_rank > 0 or training_args.n_gpu > 1:
+        raise NotImplementedError("Multi-GPU encoding is not supported.")
+    
+    args.model_path = model_args.model_name_or_path
+    args.batch_size = training_args.per_device_eval_batch_size
+    args.max_length = data_args.query_max_len
+    args.pooling_method = model_args.pooling
+
 
     index_builder = Index_Builder(
         retrieval_method=args.retrieval_method,
         model_path=args.model_path,
-        corpus_path=args.corpus_path,
+        corpus_path=data_args.corpus_path,
         save_dir=args.save_dir,
-        max_length=args.max_length,
+        max_length=training_args.max_length,
         batch_size=args.batch_size,
-        fp16=args.fp16,
-        bf16=args.bf16,
+        fp16=training_args.fp16,
+        bf16=training_args.bf16,
         pooling_method=args.pooling_method,
         instruction=args.instruction,
         faiss_type=args.faiss_type,
@@ -697,7 +760,10 @@ def main():
         summary_energy=args.summary_energy,
         batched_indexing=args.batched_indexing,
         corpus_embedded_path=args.corpus_embedded_path,
-        nknn=args.nknn
+        nknn=args.nknn,
+        model_args=model_args,
+        data_args=data_args,
+        training_args=training_args,
     )
     index_builder.build_index()
 

@@ -20,7 +20,7 @@ model2pooling:
 
 # Indexes path for retrieval models
 method2index:
-  bge: /home/thuy0050/mg61_scratch2/thuy0050/exp/tevatron/temporal_nobel_prize/bge-base-en-v1.5/bge-base-en-v1.5/bge-base-en-v1.5/dense_Flat.index
+  bge: ~
   e5: ~
   bm25: ~
   contriever: ~
@@ -105,7 +105,16 @@ generator_model: "qwen3-0.6B" # name or path of the generator model
 # setting for openai model, only valid in openai framework
 
 # generator_max_input_len: 1024 # max length of the input
+
+# VLLM's LLM-specific
+max_num_batched_tokens: 16384 # For prefix fill, larger mean less kv cache
+max_num_seqs: 128 # Limit batch size
+max_model_len: 2048 # Limit context window
+enforce_eager: True # disable graph capturing completely if True
+
+# Qwen3-specific
 enable_thinking: False
+
 generation_params:
   max_tokens: 32768
 
@@ -126,7 +135,7 @@ generation_params:
 
 
 use_fid: False # whether to use FID, only valid in encoder-decoder model
-gpu_memory_utilization: 0.85 # ratio of gpu's memory usage for generator
+gpu_memory_utilization: 0.9 # ratio of gpu's memory usage for generator
 
 # -------------Evaluation Settings------------#
 # Metrics to evaluate the result
